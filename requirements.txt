@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart
+numpy
+librosa
+soundfile
+tensorflow-cpu
+tensorflow-hub
+pandas
+scipy
+noisereduce
+apscheduler
+pytz
+imageio-ffmpeg
