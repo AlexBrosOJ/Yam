@@ -378,6 +378,13 @@ async def get_stats(device_id: str):
             status_code=500
         )
 
+from fastapi.responses import RedirectResponse
+
+@app.get("/debug/stats/{device_id}")
+async def debug_stats_redirect(device_id: str):
+    """Редирект со старого endpoint'а на новый"""
+    return RedirectResponse(url=f"/stats/{device_id}")
+
 @app.get("/records/all")
 async def get_all_records(
     device_id: str = None, 
@@ -625,3 +632,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Starting IMPROVED COUGH SERVER on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
