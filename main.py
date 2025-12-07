@@ -1,8 +1,7 @@
-# server_fixed_stats.py
 import os
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -13,9 +12,8 @@ import tensorflow as tf
 import tensorflow_hub as hub
 import librosa
 import tempfile
-import noisereduce as nr
-import scipy.signal as signal
 import pytz
+import joblib
 
 # ---- Logging ----
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +24,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
+CLEANUP_INTERVAL_HOURS = 1  # Удалять записи старше 1 часа
+THRESHOLD = 0.5  # Порог для кашля (можешь поменять)
 
 def get_current_datetime():
     return datetime.now(SERVER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
@@ -35,9 +35,13 @@ def get_current_date():
 
 # ---- Database ----
 DB_PATH = "cough_db.db"
+
 def init_db():
+    """Инициализация БД с автоматической очисткой"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    # Основная таблица
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS cough_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,121 +56,217 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Индексы для быстрого поиска
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_device_time ON cough_records(device_id, timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_cough_detected ON cough_records(cough_detected)')
+    
     conn.commit()
     conn.close()
-    logger.info("✅ Database initialized")
+    
+    # Автоматически чистим старые записи при старте
+    cleanup_old_records()
+    logger.info("✅ Database initialized with cleanup")
 
-init_db()
+def cleanup_old_records():
+    """Удаление записей старше CLEANUP_INTERVAL_HOURS часов"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cutoff_time = (datetime.now(SERVER_TIMEZONE) - 
+                      timedelta(hours=CLEANUP_INTERVAL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+        
+        cursor.execute('''
+            DELETE FROM cough_records 
+            WHERE timestamp < ?
+        ''', (cutoff_time,))
+        
+        deleted_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        if deleted_count > 0:
+            logger.info(f"🧹 Удалено {deleted_count} записей старше {CLEANUP_INTERVAL_HOURS} часов")
+        
+        return deleted_count
+    except Exception as e:
+        logger.error(f"Ошибка очистки БД: {e}")
+        return 0
 
 # ---- Models ----
 OUR_MODEL = None
 YAMNET_MODEL = None
+SCALER = None
 
 def load_models():
-    global OUR_MODEL, YAMNET_MODEL
+    """Загрузка новой модели и scaler'а"""
+    global OUR_MODEL, YAMNET_MODEL, SCALER
+    
     try:
-        OUR_MODEL = tf.keras.models.load_model('improved_cough_model.keras', compile=False)
+        # 1. Новая улучшенная модель (2079 входов)
+        OUR_MODEL = tf.keras.models.load_model(
+            'cough_detection_improved_model.keras', 
+            compile=False
+        )
+        logger.info("✅ Новая модель загружена (2079 фич)")
+        
+        # 2. YAMNet
         YAMNET_MODEL = hub.load('https://tfhub.dev/google/yamnet/1')
-        logger.info("✅ Improved models loaded")
+        logger.info("✅ YAMNet загружен")
+        
+        # 3. Scaler из обучения (ОБЯЗАТЕЛЬНО!)
+        SCALER = joblib.load('cough_scaler.pkl')
+        logger.info("✅ Scaler загружен")
+        
     except Exception as e:
-        logger.error(f"❌ Model load failed: {e}")
+        logger.error(f"❌ Ошибка загрузки моделей: {e}")
+        raise
 
-load_models()
-
-def preprocess_audio(waveform, sr):
+# ---- Feature Extraction (НОВЫЙ ФОРМАТ) ----
+def extract_features_new(waveform, sr, yamnet_model):
+    """Извлекает 2079 фич как в новой модели обучения"""
     try:
-        waveform = librosa.effects.preemphasis(waveform)
+        # 1. YAMNet embeddings
+        waveform_tf = tf.convert_to_tensor(waveform, dtype=tf.float32)
+        _, embeddings, _ = yamnet_model(waveform_tf)
         
-        if len(waveform) > 8000:
-            try:
-                noise_sample = waveform[:4000]
-                waveform = nr.reduce_noise(y=waveform, sr=sr, y_noise=noise_sample, prop_decrease=0.7)
-            except:
-                pass
+        # Два типа пуллинга
+        avg_pool = tf.reduce_mean(embeddings, axis=0).numpy()      # 1024
+        max_pool = tf.reduce_max(embeddings, axis=0).numpy()       # 1024
         
-        sos = signal.butter(4, [80, 4000], 'bandpass', fs=sr, output='sos')
-        waveform = signal.sosfilt(sos, waveform)
+        # 2. MFCC с mean и std
+        mfcc = librosa.feature.mfcc(
+            y=waveform, sr=sr, n_mfcc=13, hop_length=512
+        )
+        mfcc_mean = np.mean(mfcc, axis=1)    # 13
+        mfcc_std = np.std(mfcc, axis=1)      # 13
         
-        max_amp = np.max(np.abs(waveform))
-        if max_amp < 0.01:
-            return None
-        waveform = waveform / max_amp * 0.91
+        # 3. Спектральные фичи
+        spectral_centroid = librosa.feature.spectral_centroid(
+            y=waveform, sr=sr, hop_length=512
+        )[0]
+        spectral_bandwidth = librosa.feature.spectral_bandwidth(
+            y=waveform, sr=sr, hop_length=512
+        )[0]
         
-        return waveform
-    except:
+        spectral_features = np.array([
+            np.mean(spectral_centroid),      # 1
+            np.std(spectral_centroid),       # 1  
+            np.mean(spectral_bandwidth)      # 1
+        ])  # 3 фичи
+        
+        # 4. Zero crossing rate
+        zcr = librosa.feature.zero_crossing_rate(
+            waveform, hop_length=512
+        )[0]
+        zcr_mean = np.mean(zcr)  # 1
+        
+        # 5. RMS энергии
+        rms = librosa.feature.rms(y=waveform, hop_length=512)[0]
+        rms_mean = np.mean(rms)  # 1
+        
+        # Собираем ВСЕ фичи (2079)
+        combined = np.concatenate([
+            avg_pool,           # 1024
+            max_pool,           # 1024  
+            mfcc_mean,          # 13
+            mfcc_std,           # 13
+            spectral_features,  # 3
+            [zcr_mean, rms_mean]  # 2
+        ])
+        
+        return combined
+        
+    except Exception as e:
+        logger.error(f"Ошибка извлечения фич: {e}")
         return None
 
 def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
-    if not OUR_MODEL:
-        return {"probability": 0.0, "cough_detected": False, "message": "Model not loaded"}
+    """Анализ аудио с НОВОЙ моделью"""
+    if not OUR_MODEL or not SCALER or not YAMNET_MODEL:
+        return {"probability": 0.0, "cough_detected": False, "message": "Модели не загружены"}
     
     try:
+        # Временный файл
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
         
+        # Загрузка аудио
         waveform, sr = librosa.load(tmp_path, sr=16000, duration=1.0)
         os.unlink(tmp_path)
         
+        # Проверка на тишину
         rms = float(np.sqrt(np.mean(waveform**2)))
         if rms < 0.01:
-            return {"probability": 0.0, "cough_detected": False, "message": "Silence"}
+            return {"probability": 0.0, "cough_detected": False, "message": "Тишина"}
         
-        waveform = preprocess_audio(waveform, sr)
-        if waveform is None:
-            return {"probability": 0.0, "cough_detected": False, "message": "Too quiet after processing"}
+        # Нормализация (как в новой модели обучения)
+        max_val = np.max(np.abs(waveform))
+        if max_val < 0.01:
+            return {"probability": 0.0, "cough_detected": False, "message": "Слишком тихо"}
         
+        waveform = waveform / (max_val + 1e-8)
+        
+        # Дополнение до 1 секунды
         target_length = 16000
         if len(waveform) < target_length:
             waveform = np.pad(waveform, (0, target_length - len(waveform)))
         else:
             waveform = waveform[:target_length]
         
-        waveform_tf = tf.convert_to_tensor(waveform, dtype=tf.float32)
-        _, embeddings, _ = YAMNET_MODEL(waveform_tf)
-        avg_embedding = tf.reduce_mean(embeddings, axis=0).numpy()
+        # Извлечение НОВЫХ фич (2079)
+        features = extract_features_new(waveform, sr, YAMNET_MODEL)
+        if features is None:
+            return {"probability": 0.0, "cough_detected": False, "message": "Ошибка извлечения фич"}
         
-        mfcc = librosa.feature.mfcc(y=waveform, sr=sr, n_mfcc=13)
-        mfcc_features = np.mean(mfcc, axis=1)
+        # Нормализация через scaler (ВАЖНО!)
+        features_scaled = SCALER.transform(features.reshape(1, -1))
         
-        combined_features = np.concatenate([avg_embedding, mfcc_features]).reshape(1, -1)
-        
-        prediction = OUR_MODEL.predict(combined_features, verbose=0)
+        # Предсказание
+        prediction = OUR_MODEL.predict(features_scaled, verbose=0)
         prob = float(prediction[0][0])
         
-        is_cough = prob > 0.546
+        # Классификация
+        is_cough = prob > THRESHOLD
         
-        logger.info(f"🎯 IMPROVED MODEL: {filename} | prob={prob:.3f} | cough={is_cough}")
+        logger.info(f"🎯 НОВАЯ МОДЕЛЬ: {filename} | prob={prob:.3f} | cough={is_cough}")
         
         return {
             "probability": prob,
-            "cough_detected": is_cough,
+            "cough_detected": bool(is_cough),
             "confidence": prob,
             "message": "COUGH_DETECTED" if is_cough else "NO_COUGH",
             "cough_count": 1 if is_cough else 0
         }
         
     except Exception as e:
-        logger.error(f"Analysis error: {e}")
-        return {"probability": 0.0, "cough_detected": False, "message": f"Error: {str(e)}"}
+        logger.error(f"Ошибка анализа: {e}")
+        return {"probability": 0.0, "cough_detected": False, "message": f"Ошибка: {str(e)}"}
+
+# ---- API Endpoints ----
 
 @app.post("/upload")
 async def upload_audio(audio: UploadFile = File(...), device_id: str = Form("unknown")):
-    logger.info(f"📥 Upload: {audio.filename}, device_id: {device_id}")
+    """Загрузка аудио и анализ"""
+    logger.info(f"📥 Загрузка: {audio.filename}, device_id: {device_id}")
     
     try:
+        # Автоочистка старых записей при каждой загрузке
+        cleanup_old_records()
+        
+        # Чтение файла
         raw = await audio.read()
         if len(raw) == 0:
-            raise HTTPException(400, "Empty file")
+            raise HTTPException(400, "Пустой файл")
         
         current_datetime = get_current_datetime()
-        current_date = get_current_date()
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{timestamp}_{device_id}_{audio.filename}"
-        
+        # Анализ
         result = analyze_audio(raw, audio.filename)
         
+        # Сохранение в БД
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
@@ -175,36 +275,34 @@ async def upload_audio(audio: UploadFile = File(...), device_id: str = Form("unk
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             device_id, 
-            filename,
-            "",
+            audio.filename,
+            "",  # file_path оставляем пустым
             float(result["probability"]),
             int(result["cough_detected"]),
             result["message"],
-            "[]",
-            "{}",
+            "[]",  # top_classes
+            "{}",  # cough_stats
             current_datetime
         ))
         conn.commit()
         conn.close()
         
-        logger.info(f"✅ Analysis result: {result}")
+        logger.info(f"✅ Результат: {result}")
         return JSONResponse({"status": "success", **result})
         
     except Exception as e:
-        logger.error(f"Upload error: {e}")
+        logger.error(f"Ошибка загрузки: {e}")
         raise HTTPException(500, str(e))
 
-@app.get("/debug/stats/{device_id}")
-async def debug_stats(device_id: str):
-    """ФИКСИРОВАННАЯ СТАТИСТИКА - ТОЧНО КАК ОЖИДАЕТ ПРИЛОЖЕНИЕ"""
+@app.get("/stats/{device_id}")
+async def get_stats(device_id: str):
+    """Статистика за сегодня (основной endpoint)"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         today = get_current_date()
         
-        logger.info(f"🔍 DEBUG STATS: device_id={device_id}, today={today}")
-        
-        # Основная статистика за сегодня - ФИКСИРУЕМ ИМЕНА ПОЛЕЙ
+        # Основная статистика
         cursor.execute('''
             SELECT 
                 COUNT(*) as total_recordings,
@@ -219,9 +317,7 @@ async def debug_stats(device_id: str):
         total_coughs = int(stats[1] or 0) if stats else 0
         avg_probability = float(stats[2] or 0.0) if stats and stats[2] is not None else 0.0
         
-        logger.info(f"📊 Статистика сегодня: total={total_recordings}, coughs={total_coughs}, avg_prob={avg_probability}")
-        
-        # Статистика по часам - ФИКСИРУЕМ ФОРМАТ
+        # Почасовые данные
         hourly_stats = []
         for hour in range(24):
             hour_str = f"{hour:02d}:00"
@@ -234,7 +330,7 @@ async def debug_stats(device_id: str):
             count = int(count_row[0] or 0) if count_row else 0
             hourly_stats.append({"hour": hour_str, "count": count})
         
-        # Последние кашли - ФИКСИРУЕМ ФОРМАТ
+        # Последние кашли
         cursor.execute('''
             SELECT timestamp, probability FROM cough_records
             WHERE device_id=? AND cough_detected=1
@@ -245,22 +341,18 @@ async def debug_stats(device_id: str):
             for row in cursor.fetchall()
         ]
         
-        # Паттерны - ФИКСИРУЕМ ФОРМАТ
+        # Паттерны
         peak_hours = "Нет данных"
         cough_frequency = "0 раз/день"
         
         if total_coughs > 0:
-            # Находим пиковые часы
             if hourly_stats:
                 max_hour = max(hourly_stats, key=lambda x: x["count"])
                 peak_hours = f"{max_hour['hour']} ({max_hour['count']} раз)"
-            
-            # Частота кашля
             cough_frequency = f"{total_coughs} раз/день"
         
         conn.close()
         
-        # ФИКСИРУЕМ СТРУКТУРУ ОТВЕТА - ТОЧНО КАК В СТАРОМ СЕРВЕРЕ
         result = {
             "today_stats": {
                 "total_recordings": total_recordings,
@@ -277,23 +369,196 @@ async def debug_stats(device_id: str):
             }
         }
         
-        logger.info(f"📊 Финальный результат статистики: {result}")
         return result
         
     except Exception as e:
-        logger.exception(f"DEBUG Stats error: {e}")
+        logger.exception(f"Ошибка статистики: {e}")
         return JSONResponse(
             {"status": "error", "message": str(e)},
             status_code=500
         )
 
-@app.get("/stats/{device_id}")
-async def get_stats(device_id: str):
-    """Основная статистика (для совместимости)"""
+@app.get("/records/all")
+async def get_all_records(
+    device_id: str = None, 
+    limit: int = 100,
+    offset: int = 0,
+    include_audio: bool = False
+):
+    """Получить ВСЕ записи (с пагинацией)"""
     try:
-        # Просто вызываем debug_stats для единообразия
-        return await debug_stats(device_id)
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row  # Для доступа по имени колонок
+        cursor = conn.cursor()
+        
+        # Определяем запрос в зависимости от параметров
+        if device_id:
+            query = '''
+                SELECT * FROM cough_records 
+                WHERE device_id=? 
+                ORDER BY timestamp DESC 
+                LIMIT ? OFFSET ?
+            '''
+            params = (device_id, limit, offset)
+            # Также получаем общее количество для этого device_id
+            cursor.execute('SELECT COUNT(*) FROM cough_records WHERE device_id=?', (device_id,))
+        else:
+            query = '''
+                SELECT * FROM cough_records 
+                ORDER BY timestamp DESC 
+                LIMIT ? OFFSET ?
+            '''
+            params = (limit, offset)
+            # Общее количество всех записей
+            cursor.execute('SELECT COUNT(*) FROM cough_records')
+        
+        total_count = cursor.fetchone()[0]
+        
+        # Выполняем основной запрос
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+        # Конвертируем в словари
+        records = []
+        for row in rows:
+            record = dict(row)
+            # Конвертируем типы
+            record['cough_detected'] = bool(record['cough_detected'])
+            record['probability'] = float(record['probability'])
+            
+            # Если не нужны аудио данные, убираем file_path
+            if not include_audio:
+                record.pop('file_path', None)
+            
+            records.append(record)
+        
+        conn.close()
+        
+        return {
+            "status": "success",
+            "total_records": total_count,
+            "returned_records": len(records),
+            "limit": limit,
+            "offset": offset,
+            "device_id": device_id,
+            "records": records
+        }
+        
     except Exception as e:
+        logger.exception(f"Ошибка получения записей: {e}")
+        return JSONResponse(
+            {"status": "error", "message": str(e)},
+            status_code=500
+        )
+
+@app.get("/records/{device_id}/count")
+async def get_records_count(device_id: str):
+    """Получить количество записей для устройства"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Общее количество
+        cursor.execute('SELECT COUNT(*) FROM cough_records WHERE device_id=?', (device_id,))
+        total = cursor.fetchone()[0]
+        
+        # Кашли сегодня
+        today = get_current_date()
+        cursor.execute('''
+            SELECT COUNT(*) FROM cough_records 
+            WHERE device_id=? AND cough_detected=1 AND DATE(timestamp)=?
+        ''', (device_id, today))
+        today_coughs = cursor.fetchone()[0]
+        
+        # Все кашли
+        cursor.execute('SELECT COUNT(*) FROM cough_records WHERE device_id=? AND cough_detected=1', (device_id,))
+        all_coughs = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return {
+            "device_id": device_id,
+            "total_records": total,
+            "coughs_today": today_coughs,
+            "total_coughs": all_coughs,
+            "last_cleanup": CLEANUP_INTERVAL_HOURS
+        }
+        
+    except Exception as e:
+        logger.exception(f"Ошибка подсчета: {e}")
+        return JSONResponse(
+            {"status": "error", "message": str(e)},
+            status_code=500
+        )
+
+@app.delete("/records/cleanup")
+async def manual_cleanup():
+    """Ручная очистка старых записей"""
+    try:
+        deleted_count = cleanup_old_records()
+        return {
+            "status": "success",
+            "message": f"Удалено {deleted_count} записей старше {CLEANUP_INTERVAL_HOURS} часов",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        logger.exception(f"Ошибка ручной очистки: {e}")
+        return JSONResponse(
+            {"status": "error", "message": str(e)},
+            status_code=500
+        )
+
+@app.get("/records/export/{device_id}")
+async def export_records(device_id: str, format: str = "json"):
+    """Экспорт записей в разных форматах"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT * FROM cough_records 
+            WHERE device_id=? 
+            ORDER BY timestamp
+        ''', (device_id,))
+        
+        rows = cursor.fetchall()
+        columns = [description[0] for description in cursor.description]
+        
+        conn.close()
+        
+        # Конвертация в словари
+        records = []
+        for row in rows:
+            record = dict(zip(columns, row))
+            record['cough_detected'] = bool(record['cough_detected'])
+            records.append(record)
+        
+        if format.lower() == "csv":
+            import csv
+            import io
+            
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(records)
+            
+            return {
+                "status": "success",
+                "format": "csv",
+                "count": len(records),
+                "data": output.getvalue()
+            }
+        
+        else:  # json по умолчанию
+            return {
+                "status": "success",
+                "format": "json",
+                "count": len(records),
+                "records": records
+            }
+        
+    except Exception as e:
+        logger.exception(f"Ошибка экспорта: {e}")
         return JSONResponse(
             {"status": "error", "message": str(e)},
             status_code=500
@@ -301,201 +566,62 @@ async def get_stats(device_id: str):
 
 @app.get("/health")
 async def health_check():
+    """Проверка здоровья сервера"""
+    model_loaded = OUR_MODEL is not None and SCALER is not None
+    db_exists = os.path.exists(DB_PATH)
+    
+    # Проверка БД
+    db_status = "healthy"
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM cough_records')
+        db_status = "healthy"
+        conn.close()
+    except:
+        db_status = "unhealthy"
+    
     return JSONResponse({
-        "status": "healthy", 
-        "model_loaded": OUR_MODEL is not None,
-        "timestamp": datetime.now().isoformat()
+        "status": "healthy" if model_loaded and db_status == "healthy" else "degraded",
+        "model_loaded": model_loaded,
+        "scaler_loaded": SCALER is not None,
+        "database": db_status,
+        "database_path": DB_PATH,
+        "cleanup_interval_hours": CLEANUP_INTERVAL_HOURS,
+        "threshold": THRESHOLD,
+        "timestamp": datetime.now().isoformat(),
+        "features_dimension": 2079 if model_loaded else "unknown"
     })
 
 @app.get("/")
 async def root():
-    return {"message": "Improved Cough Detection Server", "status": "running"}
-
-
-# server_fixed_stats.py - ДОБАВЛЯЕМ НОВЫЕ ФУНКЦИИ
-
-@app.get("/stats/{device_id}/range")
-async def get_stats_range(device_id: str, start_date: str, end_date: str):
-    """Статистика за произвольный период"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        logger.info(f"📊 RANGE STATS: device_id={device_id}, period={start_date} to {end_date}")
-        
-        # Основная статистика за период
-        cursor.execute('''
-            SELECT 
-                COUNT(*) as total_recordings,
-                SUM(cough_detected) as total_coughs,
-                AVG(CASE WHEN cough_detected=1 THEN probability ELSE NULL END) as avg_probability
-            FROM cough_records 
-            WHERE device_id=? AND DATE(timestamp) BETWEEN ? AND ?
-        ''', (device_id, start_date, end_date))
-        
-        stats = cursor.fetchone()
-        total_recordings = int(stats[0] or 0) if stats else 0
-        total_coughs = int(stats[1] or 0) if stats else 0
-        avg_probability = float(stats[2] or 0.0) if stats and stats[2] is not None else 0.0
-        
-        # Статистика по дням
-        cursor.execute('''
-            SELECT 
-                DATE(timestamp) as date,
-                COUNT(*) as total_recordings,
-                SUM(cough_detected) as daily_coughs,
-                AVG(CASE WHEN cough_detected=1 THEN probability ELSE NULL END) as avg_probability
-            FROM cough_records 
-            WHERE device_id=? AND DATE(timestamp) BETWEEN ? AND ?
-            GROUP BY DATE(timestamp)
-            ORDER BY date
-        ''', (device_id, start_date, end_date))
-        
-        daily_stats = []
-        for row in cursor.fetchall():
-            daily_stats.append({
-                "date": row[0],
-                "total_recordings": row[1],
-                "total_coughs": row[2],
-                "avg_probability": float(row[3] or 0.0)
-            })
-        
-        # Статистика по неделям
-        cursor.execute('''
-            SELECT 
-                strftime('%Y-%W', timestamp) as week,
-                COUNT(*) as total_recordings,
-                SUM(cough_detected) as weekly_coughs,
-                AVG(CASE WHEN cough_detected=1 THEN probability ELSE NULL END) as avg_probability
-            FROM cough_records 
-            WHERE device_id=? AND DATE(timestamp) BETWEEN ? AND ?
-            GROUP BY strftime('%Y-%W', timestamp)
-            ORDER BY week
-        ''', (device_id, start_date, end_date))
-        
-        weekly_stats = []
-        for row in cursor.fetchall():
-            weekly_stats.append({
-                "week": row[0],
-                "total_recordings": row[1],
-                "total_coughs": row[2],
-                "avg_probability": float(row[3] or 0.0)
-            })
-        
-        conn.close()
-        
-        result = {
-            "period_stats": {
-                "start_date": start_date,
-                "end_date": end_date,
-                "total_recordings": total_recordings,
-                "total_coughs": total_coughs,
-                "avg_probability": round(avg_probability, 3)
-            },
-            "daily_stats": daily_stats,
-            "weekly_stats": weekly_stats
+    return {
+        "message": "🔥 УЛУЧШЕННЫЙ Сервер Детекции Кашля",
+        "version": "2.0",
+        "features": "Новая модель (2079 фич), автоочистка, экспорт записей",
+        "endpoints": {
+            "POST /upload": "Загрузить аудио для анализа",
+            "GET /stats/{device_id}": "Статистика за сегодня",
+            "GET /records/all": "Все записи (с пагинацией)",
+            "GET /records/{device_id}/count": "Количество записей",
+            "GET /records/export/{device_id}": "Экспорт записей",
+            "DELETE /records/cleanup": "Ручная очистка",
+            "GET /health": "Проверка здоровья"
         }
-        
-        logger.info(f"📊 Range stats result: {result}")
-        return result
-        
-    except Exception as e:
-        logger.exception(f"Range stats error: {e}")
-        return JSONResponse(
-            {"status": "error", "message": str(e)},
-            status_code=500
-        )
+    }
 
-@app.get("/stats/{device_id}/available_dates")
-async def get_available_dates(device_id: str):
-    """Получить все доступные даты для устройства"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT DISTINCT DATE(timestamp) as date 
-            FROM cough_records 
-            WHERE device_id=? 
-            ORDER BY date DESC
-        ''', (device_id,))
-        
-        dates = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        
-        return {"available_dates": dates}
-        
-    except Exception as e:
-        logger.exception(f"Available dates error: {e}")
-        return JSONResponse(
-            {"status": "error", "message": str(e)},
-            status_code=500
-        )
+# ---- Startup ----
+@app.on_event("startup")
+async def startup_event():
+    """Запуск при старте сервера"""
+    logger.info("🚀 Запуск улучшенного сервера детекции кашля...")
+    init_db()
+    load_models()
+    logger.info(f"✅ Сервер готов! Порог кашля: {THRESHOLD}")
+    logger.info(f"🧹 Автоочистка каждые {CLEANUP_INTERVAL_HOURS} часов")
 
-@app.get("/stats/{device_id}/daily/{date}")
-async def get_daily_stats(device_id: str, date: str):
-    """Статистика за конкретный день"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Основная статистика за день
-        cursor.execute('''
-            SELECT 
-                COUNT(*) as total_recordings,
-                SUM(cough_detected) as total_coughs,
-                AVG(CASE WHEN cough_detected=1 THEN probability ELSE NULL END) as avg_probability
-            FROM cough_records 
-            WHERE device_id=? AND DATE(timestamp)=?
-        ''', (device_id, date))
-        
-        stats = cursor.fetchone()
-        total_recordings = int(stats[0] or 0) if stats else 0
-        total_coughs = int(stats[1] or 0) if stats else 0
-        avg_probability = float(stats[2] or 0.0) if stats and stats[2] is not None else 0.0
-        
-        # Почасовые данные
-        hourly_stats = []
-        for hour in range(24):
-            hour_str = f"{hour:02d}:00"
-            cursor.execute('''
-                SELECT COUNT(*) FROM cough_records
-                WHERE device_id=? AND cough_detected=1 AND DATE(timestamp)=? 
-                AND strftime('%H', timestamp)=?
-            ''', (device_id, date, f"{hour:02d}"))
-            count_row = cursor.fetchone()
-            count = int(count_row[0] or 0) if count_row else 0
-            hourly_stats.append({"hour": hour_str, "count": count})
-        
-        conn.close()
-        
-        result = {
-            "date": date,
-            "stats": {
-                "total_recordings": total_recordings,
-                "total_coughs": total_coughs,
-                "avg_probability": round(avg_probability, 3)
-            },
-            "hourly_stats": hourly_stats
-        }
-        
-        return result
-        
-    except Exception as e:
-        logger.exception(f"Daily stats error: {e}")
-        return JSONResponse(
-            {"status": "error", "message": str(e)},
-            status_code=500
-        )
-
+# ---- Main ----
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🚀 Starting FIXED STATS server on port {port}")
+    logger.info(f"🚀 Starting IMPROVED COUGH SERVER on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
-
-
-
-
-
-
-
