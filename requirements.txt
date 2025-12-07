@@ -12,3 +12,4 @@ noisereduce
 apscheduler
 pytz
 imageio-ffmpeg
+joblib
