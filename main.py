@@ -208,7 +208,12 @@ def extract_features_new(waveform, sr, yamnet_model):
 def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
     """Анализ аудио"""
     if not OUR_MODEL or not SCALER or not YAMNET_MODEL:
-        return {"probability": 0.0, "cough_detected": False, "message": "Модели не загружены"}
+        return {
+            "probability": 0.0, 
+            "cough_detected": False, 
+            "message": "Модели не загружены",
+            "cough_count": 0  # ← ДОБАВЬ ЗДЕСЬ
+        }
     
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
@@ -220,11 +225,21 @@ def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
         
         rms = float(np.sqrt(np.mean(waveform**2)))
         if rms < 0.01:
-            return {"probability": 0.0, "cough_detected": False, "message": "Тишина"}
+            return {
+                "probability": 0.0, 
+                "cough_detected": False, 
+                "message": "Тишина",
+                "cough_count": 0  # ← ДОБАВЬ ЗДЕСЬ
+            }
         
         max_val = np.max(np.abs(waveform))
         if max_val < 0.01:
-            return {"probability": 0.0, "cough_detected": False, "message": "Слишком тихо"}
+            return {
+                "probability": 0.0, 
+                "cough_detected": False, 
+                "message": "Слишком тихо",
+                "cough_count": 0  # ← ДОБАВЬ ЗДЕСЬ
+            }
         
         waveform = waveform / (max_val + 1e-8)
         
@@ -236,7 +251,12 @@ def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
         
         features = extract_features_new(waveform, sr, YAMNET_MODEL)
         if features is None:
-            return {"probability": 0.0, "cough_detected": False, "message": "Ошибка извлечения фич"}
+            return {
+                "probability": 0.0, 
+                "cough_detected": False, 
+                "message": "Ошибка извлечения фич",
+                "cough_count": 0  # ← ДОБАВЬ ЗДЕСЬ
+            }
         
         features_scaled = SCALER.transform(features.reshape(1, -1))
         prediction = OUR_MODEL.predict(features_scaled, verbose=0)
@@ -251,12 +271,17 @@ def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
             "probability": prob,
             "cough_detected": bool(is_cough),
             "message": "COUGH_DETECTED" if is_cough else "NO_COUGH",
-            "cough_count": cough_count
+            "cough_count": cough_count  # ← УЖЕ ЕСТЬ, НО ПРОВЕРЬ
         }
         
     except Exception as e:
         logger.error(f"Ошибка анализа: {e}")
-        return {"probability": 0.0, "cough_detected": False, "message": f"Ошибка: {str(e)}", "cough_count": 0}
+        return {
+            "probability": 0.0, 
+            "cough_detected": False, 
+            "message": f"Ошибка: {str(e)}", 
+            "cough_count": 0  # ← ДОБАВЬ ЗДЕСЬ
+        }
 
 # ---- API Endpoints ----
 
@@ -279,6 +304,10 @@ async def upload_audio(audio: UploadFile = File(...), device_id: str = Form("unk
         # Анализ аудио
         result = analyze_audio(raw, audio.filename)
         
+        # 🔥 ВАЖНО: Проверяем наличие cough_count
+        cough_count = result.get("cough_count", 0)  # ← ИСПОЛЬЗУЙ .get() для безопасности
+        logger.info(f"📊 Результат анализа: cough_detected={result['cough_detected']}, cough_count={cough_count}")
+        
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
@@ -292,7 +321,7 @@ async def upload_audio(audio: UploadFile = File(...), device_id: str = Form("unk
             audio.filename,
             float(result["probability"]),
             int(result["cough_detected"]),
-            result["cough_count"],
+            cough_count,  # ← ИСПОЛЬЗУЙ ПЕРЕМЕННУЮ
             result["message"],
             current_datetime
         ))
@@ -325,7 +354,7 @@ async def upload_audio(audio: UploadFile = File(...), device_id: str = Form("unk
             WHERE device_id=? AND date=?
         ''', (
             int(result["cough_detected"]),      # +1 если обнаружен кашель
-            result["cough_count"],              # количество кашлевых эпизодов
+            cough_count,                        # количество кашлевых эпизодов ← ИСПОЛЬЗУЙ ПЕРЕМЕННУЮ
             avg_probability,
             current_datetime,
             device_id,
@@ -338,17 +367,21 @@ async def upload_audio(audio: UploadFile = File(...), device_id: str = Form("unk
         conn.commit()
         conn.close()
         
-        logger.info(f"✅ Статистика обновлена: total_recordings +1, coughs +{int(result['cough_detected'])}")
+        logger.info(f"✅ Статистика обновлена: total_recordings +1, coughs +{int(result['cough_detected'])}, episodes +{cough_count}")
         
+        # 🔥 Возвращаем ответ в правильном формате для Android
         return JSONResponse({
             "status": "success", 
-            **result,
+            "probability": result["probability"],
+            "cough_detected": result["cough_detected"],
+            "message": result["message"],
+            "cough_count": cough_count,  # ← ВОЗВРАЩАЕМ В ОТВЕТЕ
             "stats_updated": True
         })
         
     except Exception as e:
-        logger.error(f"Ошибка загрузки: {e}")
-        raise HTTPException(500, str(e))
+        logger.error(f"Ошибка загрузки: {e}", exc_info=True)  # ← ДОБАВЬ exc_info для деталей
+        raise HTTPException(500, f"Ошибка загрузки: {str(e)}")
 
 @app.get("/stats/{device_id}")
 async def get_stats(device_id: str):
@@ -800,3 +833,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Starting COUGH SERVER v2.0 on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
