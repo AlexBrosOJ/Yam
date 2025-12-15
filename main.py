@@ -24,7 +24,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
-CLEANUP_INTERVAL_HOURS = 6  # Удалять записи старше 1 часа
+CLEANUP_INTERVAL_HOURS = 6.5  # Удалять записи старше 1 часа
 THRESHOLD = 0.63  # Порог для кашля (можешь поменять)
 
 def get_current_datetime():
@@ -632,4 +632,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Starting IMPROVED COUGH SERVER on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
 
