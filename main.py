@@ -199,7 +199,7 @@ def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
         
         # Проверка на тишину
         rms = float(np.sqrt(np.mean(waveform**2)))
-        if rms < 0.03:
+        if rms < 0.02:
             return {"probability": 0.0, "cough_detected": False, "message": "Тишина"}
         
         # Нормализация (как в новой модели обучения)
@@ -632,6 +632,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Starting IMPROVED COUGH SERVER on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
 
 
 
