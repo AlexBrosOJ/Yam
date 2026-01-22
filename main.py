@@ -106,7 +106,7 @@ def load_models():
     try:
         # 1. Новая улучшенная модель (2079 входов)
         OUR_MODEL = tf.keras.models.load_model(
-            'cough_detection_final_model.keras', 
+            'cough_detection_improved_model.keras', 
             compile=False
         )
         logger.info("✅ Новая модель загружена (2079 фич)")
@@ -116,7 +116,7 @@ def load_models():
         logger.info("✅ YAMNet загружен")
         
         # 3. Scaler из обучения (ОБЯЗАТЕЛЬНО!)
-        SCALER = joblib.load('cough_scaler_final.pkl')
+        SCALER = joblib.load('cough_scaler.pkl')
         logger.info("✅ Scaler загружен")
         
     except Exception as e:
