@@ -25,7 +25,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
 CLEANUP_INTERVAL_HOURS = 5  # Удалять записи старше 1 часа
-THRESHOLD = 0.645  # Порог для кашля (можешь поменять)
+THRESHOLD = 0.625  # Порог для кашля (можешь поменять)
 
 def get_current_datetime():
     return datetime.now(SERVER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
@@ -106,7 +106,7 @@ def load_models():
     try:
         # 1. Новая улучшенная модель (2079 входов)
         OUR_MODEL = tf.keras.models.load_model(
-            'cough_detection_final_model.keras', 
+            'cough_detection_energy_peaks.keras', 
             compile=False
         )
         logger.info("✅ Новая модель загружена (2079 фич)")
@@ -116,7 +116,7 @@ def load_models():
         logger.info("✅ YAMNet загружен")
         
         # 3. Scaler из обучения (ОБЯЗАТЕЛЬНО!)
-        SCALER = joblib.load('cough_scaler_final.pkl')
+        SCALER = joblib.load('cough_scaler_energy_peaks.pkl')
         logger.info("✅ Scaler загружен")
         
     except Exception as e:
