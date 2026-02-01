@@ -25,7 +25,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
 CLEANUP_INTERVAL_HOURS = 5  # Удалять записи старше 1 часа
-THRESHOLD = 0.625  # Порог для кашля (можешь поменять)
+THRESHOLD = 0.63  # Порог для кашля (можешь поменять)
 
 def get_current_datetime():
     return datetime.now(SERVER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
