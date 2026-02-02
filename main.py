@@ -25,7 +25,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
 CLEANUP_INTERVAL_HOURS = 5  # Удалять записи старше 1 часа
-THRESHOLD = 0.745  # Порог для кашля (можешь поменять)
+THRESHOLD = 0.65  # Порог для кашля (можешь поменять)
 
 def get_current_datetime():
     return datetime.now(SERVER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
@@ -100,23 +100,22 @@ YAMNET_MODEL = None
 SCALER = None
 
 def load_models():
-    """Загрузка новой модели и scaler'а"""
     global OUR_MODEL, YAMNET_MODEL, SCALER
     
     try:
-        # 1. Новая улучшенная модель (2079 входов)
+        # 1. Новая улучшенная модель
         OUR_MODEL = tf.keras.models.load_model(
-            'cough_detection_energy_peaks.keras', 
+            'cough_detection_optimized.keras',  # НОВАЯ МОДЕЛЬ
             compile=False
         )
-        logger.info("✅ Новая модель загружена (2079 фич)")
+        logger.info("✅ Новая оптимизированная модель загружена (2086 фич)")
         
         # 2. YAMNet
         YAMNET_MODEL = hub.load('https://tfhub.dev/google/yamnet/1')
         logger.info("✅ YAMNet загружен")
         
-        # 3. Scaler из обучения (ОБЯЗАТЕЛЬНО!)
-        SCALER = joblib.load('cough_scaler_energy_peaks.pkl')
+        # 3. Scaler из обучения
+        SCALER = joblib.load('cough_scaler_optimized.pkl')  # НОВЫЙ SCALER
         logger.info("✅ Scaler загружен")
         
     except Exception as e:
@@ -125,17 +124,24 @@ def load_models():
 
 # ---- Feature Extraction (НОВЫЙ ФОРМАТ) ----
 def extract_features_new(waveform, sr, yamnet_model):
-    """Извлекает 2079 фич как в новой модели обучения"""
+    """Извлекает 2086 фич (2079 базовых + 7 специфичных для кашля)"""
     try:
-        # 1. YAMNet embeddings
+        # Проверка на тишину
+        if np.max(np.abs(waveform)) < 0.01:
+            return None
+        
+        # Нормализация
+        max_val = np.max(np.abs(waveform))
+        waveform = waveform / (max_val + 1e-8)
+        
+        # 1. YAMNet embeddings (основные фичи)
         waveform_tf = tf.convert_to_tensor(waveform, dtype=tf.float32)
         _, embeddings, _ = yamnet_model(waveform_tf)
         
-        # Два типа пуллинга
         avg_pool = tf.reduce_mean(embeddings, axis=0).numpy()      # 1024
         max_pool = tf.reduce_max(embeddings, axis=0).numpy()       # 1024
         
-        # 2. MFCC с mean и std
+        # 2. MFCC
         mfcc = librosa.feature.mfcc(
             y=waveform, sr=sr, n_mfcc=13, hop_length=512
         )
@@ -166,15 +172,93 @@ def extract_features_new(waveform, sr, yamnet_model):
         rms = librosa.feature.rms(y=waveform, hop_length=512)[0]
         rms_mean = np.mean(rms)  # 1
         
-        # Собираем ВСЕ фичи (2079)
+        # =============================================
+        # 6. НОВЫЕ СПЕЦИФИЧНЫЕ ФИЧИ ДЛЯ КАШЛЯ (7 штук)
+        # =============================================
+        
+        # 6.1. Количество пиков энергии (кашель имеет резкие всплески)
+        rms_normalized = (rms - np.min(rms)) / (np.max(rms) - np.min(rms) + 1e-8)
+        
+        # Используем простой метод поиска пиков для надежности
+        peaks = []
+        for i in range(1, len(rms_normalized)-1):
+            if (rms_normalized[i] > rms_normalized[i-1] and 
+                rms_normalized[i] > rms_normalized[i+1] and
+                rms_normalized[i] > np.mean(rms_normalized) + 0.2 * np.std(rms_normalized)):
+                peaks.append(i)
+        
+        num_peaks = len(peaks) / max(len(rms), 1)  # Нормализованное количество
+        
+        # 6.2. Стабильность спектра (смех более стабилен, кашель - нет)
+        spectral_rolloff = librosa.feature.spectral_rolloff(
+            y=waveform, sr=sr, hop_length=512
+        )[0]
+        spectral_variation = np.std(spectral_rolloff) / (np.mean(spectral_rolloff) + 1e-8)
+        
+        # 6.3. Изменение MFCC во времени
+        mfcc_delta = librosa.feature.delta(mfcc)
+        mfcc_delta_mean = np.mean(np.abs(mfcc_delta))  # Среднее абсолютное изменение
+        
+        # 6.4. Соотношение низких/высоких частот
+        S = np.abs(librosa.stft(waveform, n_fft=2048, hop_length=512))
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+        
+        # Низкие частоты (0-500 Hz)
+        low_mask = freqs <= 500
+        # Средние частоты (500-2000 Hz)
+        mid_mask = (freqs > 500) & (freqs <= 2000)
+        # Высокие частоты (2000+ Hz)
+        high_mask = freqs > 2000
+        
+        low_energy = np.mean(S[low_mask, :]) if np.any(low_mask) else 0
+        mid_energy = np.mean(S[mid_mask, :]) if np.any(mid_mask) else 0
+        high_energy = np.mean(S[high_mask, :]) if np.any(high_mask) else 0
+        
+        low_to_mid_ratio = low_energy / (mid_energy + 1e-8)
+        low_to_high_ratio = low_energy / (high_energy + 1e-8)
+        
+        # 6.5. Энтропия спектра
+        spectral_flatness = librosa.feature.spectral_flatness(y=waveform)[0]
+        if np.any(spectral_flatness > 0):
+            spectral_entropy = -np.sum(spectral_flatness * np.log(spectral_flatness + 1e-8))
+        else:
+            spectral_entropy = 0
+        
+        # 6.6. Изменчивость энергии
+        rms_variation = np.std(rms_normalized)
+        
+        # Собираем ВСЕ фичи (2079 + 7 = 2086)
         combined = np.concatenate([
             avg_pool,           # 1024
             max_pool,           # 1024  
             mfcc_mean,          # 13
             mfcc_std,           # 13
             spectral_features,  # 3
-            [zcr_mean, rms_mean]  # 2
+            [zcr_mean, rms_mean],  # 2
+            
+            # НОВЫЕ специфичные фичи (7 шт)
+            [
+                num_peaks, 
+                spectral_variation, 
+                mfcc_delta_mean,
+                low_to_mid_ratio, 
+                low_to_high_ratio, 
+                spectral_entropy,
+                rms_variation
+            ]
         ])
+        
+        # Проверка размерности
+        expected_dim = 2086
+        if len(combined) != expected_dim:
+            # Автоматически дополняем или обрезаем
+            if len(combined) > expected_dim:
+                combined = combined[:expected_dim]
+                logger.warning(f"Фичи обрезаны до {expected_dim} (было {len(combined)})")
+            else:
+                padding = np.zeros(expected_dim - len(combined))
+                combined = np.concatenate([combined, padding])
+                logger.warning(f"Фичи дополнены до {expected_dim} (было {len(combined)})")
         
         return combined
         
@@ -216,10 +300,21 @@ def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
         else:
             waveform = waveform[:target_length]
         
-        # Извлечение НОВЫХ фич (2079)
+        # Извлечение НОВЫХ фич (2086 - 2079 базовых + 7 специфичных)
         features = extract_features_new(waveform, sr, YAMNET_MODEL)
+        # После извлечения фич добавить проверку:
         if features is None:
             return {"probability": 0.0, "cough_detected": False, "message": "Ошибка извлечения фич"}
+    
+        # Проверить размерность фич
+        if len(features) != 2086:
+            logger.error(f"Неверная размерность фич: {len(features)} вместо 2086")
+            # Попробовать дополнить нулями
+            if len(features) < 2086:
+                padding = np.zeros(2086 - len(features))
+                features = np.concatenate([features, padding])
+            else:
+                features = features[:2086]
         
         # Нормализация через scaler (ВАЖНО!)
         features_scaled = SCALER.transform(features.reshape(1, -1))
