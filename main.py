@@ -33,7 +33,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
 CLEANUP_INTERVAL_HOURS = 5
-THRESHOLD = 0.805
+THRESHOLD = 0.815
 
 # Хранилище аудио
 AUDIO_STORAGE_PATH = "cough_audio_storage"
@@ -340,6 +340,29 @@ def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
             waveform = np.pad(waveform, (0, target_length - len(waveform)))
         else:
             waveform = waveform[:target_length]
+
+        # 1. ИНИЦИАЛИЗИРУЕМ penalty
+        flatness_penalty = 1.0  # по умолчанию нет штрафа
+        flatness_mean = None
+        
+        # 2. ДОБАВЬ ПРОВЕРКУ SPECTRAL_FLATNESS (самая важная фича из анализа)
+        try:
+            spectral_flatness = librosa.feature.spectral_flatness(y=waveform)[0]
+            flatness_mean = np.mean(spectral_flatness)
+            
+            # У реального кашля spectral_flatness ~0.274, у FP ~0.029
+            # Если очень низкий - это скорее всего FP
+            if flatness_mean < 0.05:
+                logger.info(f"⚠️ Низкий spectral_flatness ({flatness_mean:.3f}) - вероятно FP")
+                # Автоматически снижаем вероятность на 30%
+                flatness_penalty = 0.7
+            elif flatness_mean > 0.2:
+                logger.info(f"✅ Высокий spectral_flatness ({flatness_mean:.3f}) - похоже на реальный кашель")
+                # Можно даже увеличить вероятность
+                flatness_penalty = 1.1  # увеличиваем на 10%
+        except Exception as e:
+            logger.warning(f"Не удалось вычислить spectral_flatness: {e}")
+            flatness_penalty = 1.0
         
         features = extract_features_new(waveform, sr, YAMNET_MODEL)
         
@@ -357,18 +380,23 @@ def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
         features_scaled = SCALER.transform(features.reshape(1, -1))
         
         prediction = OUR_MODEL.predict(features_scaled, verbose=0)
-        prob = float(prediction[0][0])
+        original_prob = float(prediction[0][0])
+        prob_adjusted = original_prob * flatness_penalty
         
-        is_cough = prob > THRESHOLD
+        is_cough = prob_adjusted > THRESHOLD
         
-        logger.info(f"🎯 Анализ: {filename} | prob={prob:.3f} | cough={is_cough}")
+        logger.info(f"🎯 Анализ: {filename} | prob={original_prob:.3f} -> {prob_adjusted:.3f} | "
+                   f"cough={is_cough} | flatness={flatness_mean if flatness_mean is not None else 'N/A':.3f}")
         
         return {
-            "probability": prob,
+            "probability": prob_adjusted,
+            "original_probability": original_prob,
             "cough_detected": bool(is_cough),
-            "confidence": prob,
+            "confidence": prob_adjusted,
             "message": "COUGH_DETECTED" if is_cough else "NO_COUGH",
-            "cough_count": 1 if is_cough else 0
+            "cough_count": 1 if is_cough else 0,
+            "spectral_flatness": flatness_mean,
+            "flatness_penalty": flatness_penalty
         }
         
     except Exception as e:
