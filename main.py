@@ -33,7 +33,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
 CLEANUP_INTERVAL_HOURS = 5
-THRESHOLD = 0.805
+THRESHOLD = 0.825
 
 # Хранилище аудио
 AUDIO_STORAGE_PATH = "cough_audio_storage"
@@ -311,9 +311,41 @@ def extract_features_new(waveform, sr, yamnet_model):
     except Exception as e:
         logger.error(f"Ошибка извлечения фич: {e}")
         return None
+    
+
+# ---- Feature penalty ----
+
+def fast_enhanced_check(waveform, sr, original_prob):
+    """Быстрая улучшенная проверка (оптимизирована для сервера)"""
+    
+    # Только 2 самые важные проверки для скорости
+    modified_prob = original_prob
+    
+    # 1. Быстрая проверка спектрального распределения
+    # Используем MFCC вместо полного STFT для скорости
+    mfcc = librosa.feature.mfcc(y=waveform, sr=sr, n_mfcc=13, hop_length=512)
+    
+    # Низкие частоты: первые 4 MFCC, средние: следующие 4
+    low_freq_energy = np.mean(np.abs(mfcc[:4, :]))
+    mid_freq_energy = np.mean(np.abs(mfcc[4:8, :]))
+    
+    if mid_freq_energy > low_freq_energy * 1.5:  # Доминируют средние частоты (речь)
+        modified_prob *= 0.9
+    
+    # 2. Быстрая проверка резкости атаки через ZCR
+    zcr = librosa.feature.zero_crossing_rate(waveform, hop_length=256)[0]
+    zcr_std = np.std(zcr)
+    
+    # Кашель имеет более резкие изменения ZCR
+    if zcr_std < 0.05:  # Слишком плавно (не кашель)
+        modified_prob *= 0.9
+    
+    return modified_prob
+
+# ---- Feature penalty ----
 
 def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
-    """Анализ аудио с новой моделью"""
+    """Анализ аудио с новой моделью и улучшенной проверкой"""
     if not OUR_MODEL or not SCALER or not YAMNET_MODEL:
         return {"probability": 0.0, "cough_detected": False, "message": "Модели не загружены"}
     
@@ -357,18 +389,29 @@ def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
         features_scaled = SCALER.transform(features.reshape(1, -1))
         
         prediction = OUR_MODEL.predict(features_scaled, verbose=0)
-        prob = float(prediction[0][0])
+        original_prob = float(prediction[0][0])
         
-        is_cough = prob > THRESHOLD
+        # === ДОБАВЛЕНА УЛУЧШЕННАЯ ПРОВЕРКА ===
+        enhanced_prob = fast_enhanced_check(waveform, sr, original_prob)
         
-        logger.info(f"🎯 Анализ: {filename} | prob={prob:.3f} | cough={is_cough}")
+        # Логируем разницу для отладки
+        prob_diff = original_prob - enhanced_prob
+        if prob_diff > 0.1:  # Значительное снижение
+            logger.warning(f"⚠️ Сильное снижение вероятности: {original_prob:.3f} → {enhanced_prob:.3f} (diff: -{prob_diff:.3f})")
+        
+        is_cough = enhanced_prob > THRESHOLD
+        
+        logger.info(f"🎯 Анализ: {filename} | orig={original_prob:.3f} | enhanced={enhanced_prob:.3f} | cough={is_cough}")
         
         return {
-            "probability": prob,
+            "probability": enhanced_prob,  # Возвращаем улучшенную вероятность
+            "original_probability": original_prob,  # Сохраняем оригинал для отладки
             "cough_detected": bool(is_cough),
-            "confidence": prob,
+            "confidence": enhanced_prob,
             "message": "COUGH_DETECTED" if is_cough else "NO_COUGH",
-            "cough_count": 1 if is_cough else 0
+            "cough_count": 1 if is_cough else 0,
+            "enhancement_applied": enhanced_prob != original_prob,  # Флаг применения улучшения
+            "probability_reduction": round(prob_diff, 3) if prob_diff > 0 else 0
         }
         
     except Exception as e:
