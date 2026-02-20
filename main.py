@@ -316,66 +316,62 @@ def extract_features_new(waveform, sr, yamnet_model):
 # ---- Feature penalty ----
 
 def fast_enhanced_check(waveform, sr, original_prob):
-    """Быстрая улучшенная проверка (оптимизирована под данные)"""
+    """Быстрая улучшенная проверка (умеренные штрафы)"""
     
     modified_prob = original_prob
     
-    # 1. Проверка соотношения низких/средних частот (low_to_mid_ratio)
+    # 1. Проверка соотношения низких/средних частот
     mfcc = librosa.feature.mfcc(y=waveform, sr=sr, n_mfcc=13, hop_length=512)
     low_freq = np.mean(np.abs(mfcc[:4, :]))      # Низкие
     mid_freq = np.mean(np.abs(mfcc[4:8, :]))     # Средние
     low_to_mid = low_freq / (mid_freq + 1e-6)
     
-    # По данным: у кашля low_to_mid ~0.33, у ложных ~0.12
+    # Умеренные штрафы: макс -20%
     if low_to_mid < 0.15:  # Слишком мало низких (ложное)
-        modified_prob *= 0.65  # Сильный штраф
+        modified_prob *= 0.8  # -10% (было -35%)
     elif low_to_mid > 0.25:  # Много низких (кашель)
-        modified_prob *= 1.2  # Бонус
+        modified_prob *= 1.15  # +10% (было +20%)
     
-    # 2. Проверка резкости атаки (attack_time_ms и peak_to_rms)
-    # Используем огибающую для поиска атак
+    # 2. Проверка резкости атаки
     envelope = np.abs(waveform)
-    # Сглаживаем для поиска пиков
     envelope_smooth = np.convolve(envelope, np.ones(1000)/1000, mode='same')
     
-    # Ищем локальные максимумы
     from scipy.signal import find_peaks
     peaks, properties = find_peaks(envelope_smooth, height=np.max(envelope_smooth)*0.3)
     
     if len(peaks) > 0:
-        # Оценка времени атаки (расстояние до предыдущего минимума)
         peak_to_rms_ratio = envelope_smooth[peaks[0]] / (np.sqrt(np.mean(waveform**2)) + 1e-6)
         
-        # По данным: у кашля peak_to_rms ~7.18, у ложных ~6.80
+        # Умеренные штрафы
         if peak_to_rms_ratio < 6.9:  # Низкая пиковость (ложное)
-            modified_prob *= 0.8
+            modified_prob *= 0.9  # -10% (было -20%)
         elif peak_to_rms_ratio > 7.1:  # Высокая пиковость (кашель)
-            modified_prob *= 1.15
+            modified_prob *= 1.1  # +10% (было +15%)
     else:
-        # Нет четких пиков - похоже на шум/ложное
-        modified_prob *= 0.7
+        # Нет пиков - легкий штраф
+        modified_prob *= 0.95  # -5% (было -30%)
     
-    # 3. Быстрая проверка спектральной плоскости (spectral_flatness_mean)
+    # 3. Проверка спектральной плоскости
     spectral_flatness = np.mean(librosa.feature.spectral_flatness(y=waveform))
     
-    # По данным: у кашля 0.056, у ложных 0.032
+    # Умеренные штрафы
     if spectral_flatness < 0.04:  # Слишком тонально (ложное)
-        modified_prob *= 0.85
+        modified_prob *= 0.9  # -5% (было -15%)
     elif spectral_flatness > 0.05:  # Более шумно (кашель)
-        modified_prob *= 1.1
+        modified_prob *= 1.15  # +5% (было +10%)
     
-    # 4. Количество пиков (num_peaks) - быстрая оценка
-    # Используем ZCR как прокси для оценки структуры
+    # 4. Количество пиков
     zcr = librosa.feature.zero_crossing_rate(waveform, hop_length=256)[0]
     zcr_peaks = len(find_peaks(zcr, height=np.mean(zcr)*1.5)[0])
     
-    # По данным: у кашля ~54 пика, у ложных ~29
+    # Умеренные штрафы
     if zcr_peaks < 35:  # Мало изменений (ложное)
-        modified_prob *= 0.75
+        modified_prob *= 0.85  # -5% (было -25%)
     elif zcr_peaks > 45:  # Много изменений (кашель)
-        modified_prob *= 1.15
+        modified_prob *= 1.15  # +5% (было +15%)
     
-    return np.clip(modified_prob, 0.0, 1.0)
+    # Возвращаем float, а не numpy тип!
+    return float(np.clip(modified_prob, 0.0, 1.0))
 
 # ---- Feature penalty ----
 
@@ -439,14 +435,14 @@ def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
         logger.info(f"🎯 Анализ: {filename} | orig={original_prob:.3f} | enhanced={enhanced_prob:.3f} | cough={is_cough}")
         
         return {
-            "probability": enhanced_prob,  # Возвращаем улучшенную вероятность
-            "original_probability": original_prob,  # Сохраняем оригинал для отладки
-            "cough_detected": bool(is_cough),
-            "confidence": enhanced_prob,
+            "probability": float(enhanced_prob),  # float()
+            "original_probability": float(original_prob),  # float()
+            "cough_detected": bool(is_cough),  # bool() а не np.bool_
+            "confidence": float(enhanced_prob),  # float()
             "message": "COUGH_DETECTED" if is_cough else "NO_COUGH",
             "cough_count": 1 if is_cough else 0,
-            "enhancement_applied": enhanced_prob != original_prob,  # Флаг применения улучшения
-            "probability_reduction": round(prob_diff, 3) if prob_diff > 0 else 0
+            "enhancement_applied": bool(enhanced_prob != original_prob),  # bool()
+            "probability_reduction": float(prob_diff) if prob_diff > 0 else 0.0  # float()
         }
         
     except Exception as e:
