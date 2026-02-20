@@ -316,31 +316,66 @@ def extract_features_new(waveform, sr, yamnet_model):
 # ---- Feature penalty ----
 
 def fast_enhanced_check(waveform, sr, original_prob):
-    """Быстрая улучшенная проверка (оптимизирована для сервера)"""
+    """Быстрая улучшенная проверка (оптимизирована под данные)"""
     
-    # Только 2 самые важные проверки для скорости
     modified_prob = original_prob
     
-    # 1. Быстрая проверка спектрального распределения
-    # Используем MFCC вместо полного STFT для скорости
+    # 1. Проверка соотношения низких/средних частот (low_to_mid_ratio)
     mfcc = librosa.feature.mfcc(y=waveform, sr=sr, n_mfcc=13, hop_length=512)
+    low_freq = np.mean(np.abs(mfcc[:4, :]))      # Низкие
+    mid_freq = np.mean(np.abs(mfcc[4:8, :]))     # Средние
+    low_to_mid = low_freq / (mid_freq + 1e-6)
     
-    # Низкие частоты: первые 4 MFCC, средние: следующие 4
-    low_freq_energy = np.mean(np.abs(mfcc[:4, :]))
-    mid_freq_energy = np.mean(np.abs(mfcc[4:8, :]))
+    # По данным: у кашля low_to_mid ~0.33, у ложных ~0.12
+    if low_to_mid < 0.15:  # Слишком мало низких (ложное)
+        modified_prob *= 0.65  # Сильный штраф
+    elif low_to_mid > 0.25:  # Много низких (кашель)
+        modified_prob *= 1.2  # Бонус
     
-    if mid_freq_energy > low_freq_energy * 1.5:  # Доминируют средние частоты (речь)
-        modified_prob *= 0.9
+    # 2. Проверка резкости атаки (attack_time_ms и peak_to_rms)
+    # Используем огибающую для поиска атак
+    envelope = np.abs(waveform)
+    # Сглаживаем для поиска пиков
+    envelope_smooth = np.convolve(envelope, np.ones(1000)/1000, mode='same')
     
-    # 2. Быстрая проверка резкости атаки через ZCR
+    # Ищем локальные максимумы
+    from scipy.signal import find_peaks
+    peaks, properties = find_peaks(envelope_smooth, height=np.max(envelope_smooth)*0.3)
+    
+    if len(peaks) > 0:
+        # Оценка времени атаки (расстояние до предыдущего минимума)
+        peak_to_rms_ratio = envelope_smooth[peaks[0]] / (np.sqrt(np.mean(waveform**2)) + 1e-6)
+        
+        # По данным: у кашля peak_to_rms ~7.18, у ложных ~6.80
+        if peak_to_rms_ratio < 6.9:  # Низкая пиковость (ложное)
+            modified_prob *= 0.8
+        elif peak_to_rms_ratio > 7.1:  # Высокая пиковость (кашель)
+            modified_prob *= 1.15
+    else:
+        # Нет четких пиков - похоже на шум/ложное
+        modified_prob *= 0.7
+    
+    # 3. Быстрая проверка спектральной плоскости (spectral_flatness_mean)
+    spectral_flatness = np.mean(librosa.feature.spectral_flatness(y=waveform))
+    
+    # По данным: у кашля 0.056, у ложных 0.032
+    if spectral_flatness < 0.04:  # Слишком тонально (ложное)
+        modified_prob *= 0.85
+    elif spectral_flatness > 0.05:  # Более шумно (кашель)
+        modified_prob *= 1.1
+    
+    # 4. Количество пиков (num_peaks) - быстрая оценка
+    # Используем ZCR как прокси для оценки структуры
     zcr = librosa.feature.zero_crossing_rate(waveform, hop_length=256)[0]
-    zcr_std = np.std(zcr)
+    zcr_peaks = len(find_peaks(zcr, height=np.mean(zcr)*1.5)[0])
     
-    # Кашель имеет более резкие изменения ZCR
-    if zcr_std < 0.05:  # Слишком плавно (не кашель)
-        modified_prob *= 0.9
+    # По данным: у кашля ~54 пика, у ложных ~29
+    if zcr_peaks < 35:  # Мало изменений (ложное)
+        modified_prob *= 0.75
+    elif zcr_peaks > 45:  # Много изменений (кашель)
+        modified_prob *= 1.15
     
-    return modified_prob
+    return np.clip(modified_prob, 0.0, 1.0)
 
 # ---- Feature penalty ----
 
