@@ -33,7 +33,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
 CLEANUP_INTERVAL_HOURS = 5
-THRESHOLD = 0.825
+THRESHOLD = 0.8
 
 # Хранилище аудио
 AUDIO_STORAGE_PATH = "cough_audio_storage"
@@ -238,7 +238,7 @@ def load_models():
     
     try:
         OUR_MODEL = tf.keras.models.load_model(
-            'cough_detection_final_optimized.keras',
+            'cough_detection_fake_aware.keras',
             compile=False
         )
         logger.info("✅ Новая оптимизированная модель загружена (2079 фич)")
@@ -246,7 +246,7 @@ def load_models():
         YAMNET_MODEL = hub.load('https://tfhub.dev/google/yamnet/1')
         logger.info("✅ YAMNet загружен")
         
-        SCALER = joblib.load('cough_scaler_final_optimized.pkl')
+        SCALER = joblib.load('cough_scaler_fake_aware.pkl')
         logger.info("✅ Scaler загружен")
         
     except Exception as e:
