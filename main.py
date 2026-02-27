@@ -33,7 +33,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
 CLEANUP_INTERVAL_HOURS = 5
-THRESHOLD = 0.825
+THRESHOLD = 0.8
 
 # Хранилище аудио
 AUDIO_STORAGE_PATH = "cough_audio_storage"
@@ -327,10 +327,10 @@ def fast_enhanced_check(waveform, sr, original_prob):
     low_to_mid = low_freq / (mid_freq + 1e-6)
     
     # Умеренные штрафы: макс -20%
-    if low_to_mid < 0.15:  # Слишком мало низких (ложное)
-        modified_prob *= 0.8  # -10% (было -35%)
-    elif low_to_mid > 0.25:  # Много низких (кашель)
-        modified_prob *= 1.15  # +10% (было +20%)
+    if low_to_mid < 0.18:  # Слишком мало низких (ложное)
+        modified_prob *= 0.75  # -10% (было -35%)
+    elif low_to_mid > 0.27:  # Много низких (кашель)
+        modified_prob *= 1.2  # +10% (было +20%)
     
     # 2. Проверка резкости атаки
     envelope = np.abs(waveform)
@@ -343,20 +343,20 @@ def fast_enhanced_check(waveform, sr, original_prob):
         peak_to_rms_ratio = envelope_smooth[peaks[0]] / (np.sqrt(np.mean(waveform**2)) + 1e-6)
         
         # Умеренные штрафы
-        if peak_to_rms_ratio < 6.9:  # Низкая пиковость (ложное)
-            modified_prob *= 0.9  # -10% (было -20%)
-        elif peak_to_rms_ratio > 7.1:  # Высокая пиковость (кашель)
-            modified_prob *= 1.1  # +10% (было +15%)
+        if peak_to_rms_ratio < 7.1:  # Низкая пиковость (ложное)
+            modified_prob *= 0.8  # -10% (было -20%)
+        elif peak_to_rms_ratio > 7.3:  # Высокая пиковость (кашель)
+            modified_prob *= 1.2  # +10% (было +15%)
     else:
         # Нет пиков - легкий штраф
-        modified_prob *= 0.95  # -5% (было -30%)
+        modified_prob *= 0.75  # -5% (было -30%)
     
     # 3. Проверка спектральной плоскости
     spectral_flatness = np.mean(librosa.feature.spectral_flatness(y=waveform))
     
     # Умеренные штрафы
     if spectral_flatness < 0.04:  # Слишком тонально (ложное)
-        modified_prob *= 0.9  # -5% (было -15%)
+        modified_prob *= 0.8  # -5% (было -15%)
     elif spectral_flatness > 0.05:  # Более шумно (кашель)
         modified_prob *= 1.15  # +5% (было +10%)
     
@@ -366,9 +366,9 @@ def fast_enhanced_check(waveform, sr, original_prob):
     
     # Умеренные штрафы
     if zcr_peaks < 35:  # Мало изменений (ложное)
-        modified_prob *= 0.85  # -5% (было -25%)
+        modified_prob *= 0.9  # -5% (было -25%)
     elif zcr_peaks > 45:  # Много изменений (кашель)
-        modified_prob *= 1.15  # +5% (было +15%)
+        modified_prob *= 1.1  # +5% (было +15%)
     
     # Возвращаем float, а не numpy тип!
     return float(np.clip(modified_prob, 0.0, 1.0))
