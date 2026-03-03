@@ -33,7 +33,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
 CLEANUP_INTERVAL_HOURS = 5
-THRESHOLD = 0.8
+THRESHOLD = 0.83
 
 # Хранилище аудио
 AUDIO_STORAGE_PATH = "cough_audio_storage"
