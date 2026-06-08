@@ -33,12 +33,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
 CLEANUP_INTERVAL_HOURS = 5
-THRESHOLD = 0.83
+THRESHOLD = 0.75
 
 # Хранилище аудио
 AUDIO_STORAGE_PATH = "cough_audio_storage"
-MAX_AUDIO_FILES = 1000  # Максимум 1000 файлов
-AUDIO_RETENTION_DAYS = 30  # Хранить файлы 30 дней
+MAX_AUDIO_FILES = 700  # Максимум 1000 файлов
+AUDIO_RETENTION_DAYS = 25  # Хранить файлы 30 дней
 
 # Создаем папки
 os.makedirs(AUDIO_STORAGE_PATH, exist_ok=True)
@@ -241,16 +241,16 @@ def load_models():
             'cough_detection_final_optimized.keras',
             compile=False
         )
-        logger.info("✅ Новая оптимизированная модель загружена (2079 фич)")
+        logger.info("Новая оптимизированная модель загружена (2079 фич)")
         
         YAMNET_MODEL = hub.load('https://tfhub.dev/google/yamnet/1')
-        logger.info("✅ YAMNet загружен")
+        logger.info("YAMNet загружен")
         
         SCALER = joblib.load('cough_scaler_final_optimized.pkl')
-        logger.info("✅ Scaler загружен")
+        logger.info("Scaler загружен")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка загрузки моделей: {e}")
+        logger.error(f"Ошибка загрузки моделей: {e}")
         raise
 
 # ---- Feature Extraction ----
@@ -328,9 +328,9 @@ def fast_enhanced_check(waveform, sr, original_prob):
     
     # Умеренные штрафы: макс -20%
     if low_to_mid < 0.18:  # Слишком мало низких (ложное)
-        modified_prob *= 0.75  # -10% (было -35%)
+        modified_prob *= 0.78  # -10% (было -35%)
     elif low_to_mid > 0.27:  # Много низких (кашель)
-        modified_prob *= 1.2  # +10% (было +20%)
+        modified_prob *= 1.25  # +10% (было +20%)
     
     # 2. Проверка резкости атаки
     envelope = np.abs(waveform)
@@ -344,9 +344,9 @@ def fast_enhanced_check(waveform, sr, original_prob):
         
         # Умеренные штрафы
         if peak_to_rms_ratio < 7.1:  # Низкая пиковость (ложное)
-            modified_prob *= 0.8  # -10% (было -20%)
+            modified_prob *= 0.82  # -10% (было -20%)
         elif peak_to_rms_ratio > 7.3:  # Высокая пиковость (кашель)
-            modified_prob *= 1.2  # +10% (было +15%)
+            modified_prob *= 1.25  # +10% (было +15%)
     else:
         # Нет пиков - легкий штраф
         modified_prob *= 0.75  # -5% (было -30%)
@@ -356,9 +356,9 @@ def fast_enhanced_check(waveform, sr, original_prob):
     
     # Умеренные штрафы
     if spectral_flatness < 0.04:  # Слишком тонально (ложное)
-        modified_prob *= 0.8  # -5% (было -15%)
+        modified_prob *= 0.82  # -5% (было -15%)
     elif spectral_flatness > 0.05:  # Более шумно (кашель)
-        modified_prob *= 1.15  # +5% (было +10%)
+        modified_prob *= 1.152  # +5% (было +10%)
     
     # 4. Количество пиков
     zcr = librosa.feature.zero_crossing_rate(waveform, hop_length=256)[0]
