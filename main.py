@@ -468,11 +468,16 @@ async def upload_audio(audio: UploadFile = File(...), device_id: str = Form("unk
         result = analyze_audio(raw, audio.filename)
         
         # Сохраняем аудио если найден кашель
-        audio_path = ""
-        audio_saved = 0
-        if result["cough_detected"]:
-            audio_path = save_cough_audio(raw, device_id, result["probability"])
-            audio_saved = 1 if audio_path else 0
+        #audio_path = ""
+        #audio_saved = 0
+        #if result["cough_detected"]:
+            #audio_path = save_cough_audio(raw, device_id, result["probability"])
+            #audio_saved = 1 if audio_path else 0
+            
+        audio_path = save_cough_audio(raw, device_id, result["probability"])
+        audio_saved = int(bool(audio_path))
+
+
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
