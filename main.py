@@ -524,7 +524,7 @@ async def download_audio(record_id: int):
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT device_id, filename, file_path, cough_detected 
+            SELECT device_id, filename, file_path 
             FROM cough_records 
             WHERE id = ?
         ''', (record_id,))
@@ -535,10 +535,7 @@ async def download_audio(record_id: int):
         if not record:
             raise HTTPException(404, f"Запись с ID {record_id} не найдена")
         
-        device_id, filename, file_path, cough_detected = record
-        
-        if not cough_detected:
-            raise HTTPException(400, "Это не запись с кашлем")
+        device_id, filename, file_path = record
         
         if not file_path or not os.path.exists(file_path):
             raise HTTPException(404, "Аудиофайл не найден или был удален")
@@ -569,9 +566,8 @@ async def list_cough_audio(
         
         query = '''
             SELECT id, device_id, filename, file_path, probability, timestamp 
-            FROM cough_records 
-            WHERE cough_detected = 1 
-            AND file_path != '' 
+            FROM cough_records  
+            WHERE file_path != '' 
             AND file_path IS NOT NULL
         '''
         params = []
@@ -639,8 +635,7 @@ async def download_all_cough_audio():
         cursor.execute('''
             SELECT id, device_id, filename, file_path, timestamp 
             FROM cough_records 
-            WHERE cough_detected = 1 
-            AND file_path != '' 
+            WHERE file_path != '' 
             AND file_path IS NOT NULL
             ORDER BY timestamp DESC
         ''')
