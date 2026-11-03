@@ -32,13 +32,13 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
-CLEANUP_INTERVAL_HOURS = 5
+CLEANUP_INTERVAL_HOURS = 1
 THRESHOLD = 0.75
 
 # Хранилище аудио
 AUDIO_STORAGE_PATH = "cough_audio_storage"
-MAX_AUDIO_FILES = 700  # Максимум 1000 файлов
-AUDIO_RETENTION_DAYS = 25  # Хранить файлы 30 дней
+MAX_AUDIO_FILES = 500  # Максимум 500 файлов
+AUDIO_RETENTION_DAYS = 5  # Хранить файлы 5 дней
 
 # Создаем папки
 os.makedirs(AUDIO_STORAGE_PATH, exist_ok=True)
