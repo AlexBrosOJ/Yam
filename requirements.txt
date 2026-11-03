@@ -1,10 +1,10 @@
 fastapi
-uvicorn[standard]==0.38.0
-python-multipart==0.0.33
+uvicorn[standard]
+python-multipart
 numpy==2.4.6
 librosa==0.11.0
 soundfile==0.14.0
-tensorflow-cpu==2.21.0
+tensorflow==2.21.0
 tensorflow-hub==0.16.1
 pandas==3.1.0
 scipy==1.17.1
