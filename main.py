@@ -5,6 +5,9 @@ import json
 import uuid
 import zipfile
 import io
+import threading
+import time
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -27,20 +30,39 @@ import joblib
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("cough_server")
 
-app = FastAPI(title="Cough Detection Server", version="3.0")
+app = FastAPI(title="Cough Detection Server", version="3.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.exception_handler(HTTPException)
+async def http_error_handler(request, error):
+    return JSONResponse({"status": "error", "message": str(error.detail)}, status_code=error.status_code)
+
 
 # ---- Configuration ----
 SERVER_TIMEZONE = pytz.timezone('Europe/Moscow')
-CLEANUP_INTERVAL_HOURS = 1
-THRESHOLD = 0.75
+# These are retention HOURS, not a scheduler interval. Keep records as long as audio.
+CLEANUP_INTERVAL_HOURS = int(os.getenv("RECORD_RETENTION_HOURS", "120"))
+THRESHOLD = float(os.getenv("COUGH_THRESHOLD", "0.50"))
+ENABLE_LEGACY_ENHANCEMENT = os.getenv("ENABLE_LEGACY_ENHANCEMENT", "false").lower() == "true"
+MIN_RMS = float(os.getenv("MIN_RMS", "0"))
+MIN_PEAK = float(os.getenv("MIN_PEAK", "0"))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))
+_MODEL_LOCK = threading.RLock()
+_UPLOAD_LOCK = threading.RLock()
+_last_cleanup = 0.0
+if not 0 <= THRESHOLD <= 1 or MIN_RMS < 0 or MIN_PEAK < 0:
+    raise ValueError("Invalid detection thresholds")
+if CLEANUP_INTERVAL_HOURS <= 0 or MAX_UPLOAD_BYTES <= 0:
+    raise ValueError("Retention and upload limit must be positive")
 
 # Хранилище аудио
-AUDIO_STORAGE_PATH = "cough_audio_storage"
-MAX_AUDIO_FILES = 500  # Максимум 500 файлов
-AUDIO_RETENTION_DAYS = 5  # Хранить файлы 5 дней
+AUDIO_STORAGE_PATH = os.getenv("AUDIO_STORAGE_PATH", "cough_audio_storage")
+MAX_AUDIO_FILES = int(os.getenv("MAX_AUDIO_FILES", "500"))  # Максимум 500 файлов
+AUDIO_RETENTION_DAYS = int(os.getenv("AUDIO_RETENTION_DAYS", "5"))  # Хранить файлы 5 дней
 
 # Создаем папки
+if MAX_AUDIO_FILES < 1 or AUDIO_RETENTION_DAYS < 1:
+    raise ValueError("Audio storage limits must be positive")
 os.makedirs(AUDIO_STORAGE_PATH, exist_ok=True)
 
 def get_current_datetime():
@@ -50,7 +72,7 @@ def get_current_date():
     return datetime.now(SERVER_TIMEZONE).strftime("%Y-%m-%d")
 
 # ---- Database ----
-DB_PATH = "cough_db.db"
+DB_PATH = os.getenv("DB_PATH", "cough_db.db")
 
 def init_db():
     """Инициализация БД с автоматической очисткой"""
@@ -84,123 +106,69 @@ def init_db():
     cleanup_old_audio_files()
     logger.info("✅ Database initialized with cleanup")
 
-def cleanup_old_records():
-    """Удаление записей старше CLEANUP_INTERVAL_HOURS часов"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cutoff_time = (datetime.now(SERVER_TIMEZONE) - 
-                      timedelta(hours=CLEANUP_INTERVAL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
-        
-        cursor.execute('''
-            DELETE FROM cough_records 
-            WHERE timestamp < ?
-        ''', (cutoff_time,))
-        
-        deleted_count = cursor.rowcount
-        conn.commit()
-        conn.close()
-        
-        if deleted_count > 0:
-            logger.info(f"🧹 Удалено {deleted_count} записей старше {CLEANUP_INTERVAL_HOURS} часов")
-        
-        return deleted_count
-    except Exception as e:
-        logger.error(f"Ошибка очистки БД: {e}")
-        return 0
+def _owned_audio_path(path):
+    root = Path(AUDIO_STORAGE_PATH).resolve()
+    candidate = Path(path)
+    return (not candidate.is_symlink() and candidate.resolve().parent == root
+            and candidate.name.startswith("cough_") and candidate.suffix == ".wav")
 
-def cleanup_old_audio_files():
-    """Удаление старых аудиофайлов"""
-    try:
-        cutoff_date = datetime.now() - timedelta(days=AUDIO_RETENTION_DAYS)
-        
-        # Получаем старые записи с аудио
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, file_path FROM cough_records 
-            WHERE file_path != '' 
-            AND timestamp < ?
-        ''', (cutoff_date.strftime("%Y-%m-%d %H:%M:%S"),))
-        
-        old_records = cursor.fetchall()
-        
-        deleted_files = 0
-        for record_id, file_path in old_records:
-            if file_path and os.path.exists(file_path):
+
+def _clear_missing_audio_references():
+    with sqlite3.connect(DB_PATH) as conn:
+        for record_id, path in conn.execute("SELECT id, file_path FROM cough_records WHERE file_path != ''").fetchall():
+            if not Path(path).is_file():
+                conn.execute("UPDATE cough_records SET file_path='', audio_saved=0 WHERE id=?", (record_id,))
+
+
+def cleanup_old_records():
+    """Remove expired records together with their owned files, without orphaning audio."""
+    cutoff = (datetime.now(SERVER_TIMEZONE) - timedelta(hours=CLEANUP_INTERVAL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT id, file_path FROM cough_records WHERE timestamp < ?", (cutoff,)).fetchall()
+        for record_id, path in rows:
+            if path and _owned_audio_path(path):
                 try:
-                    os.remove(file_path)
-                    deleted_files += 1
-                    
-                    # Обновляем запись
-                    cursor.execute('''
-                        UPDATE cough_records 
-                        SET file_path = '', audio_saved = 0 
-                        WHERE id = ?
-                    ''', (record_id,))
-                except Exception as e:
-                    logger.error(f"Ошибка удаления файла {file_path}: {e}")
-        
-        conn.commit()
-        conn.close()
-        
-        if deleted_files > 0:
-            logger.info(f"🧹 Удалено {deleted_files} старых аудиофайлов")
-        
-        # Проверяем лимит файлов
-        enforce_audio_storage_limit()
-        
-        return deleted_files
-    except Exception as e:
-        logger.error(f"Ошибка очистки аудиофайлов: {e}")
-        return 0
+                    Path(path).unlink(missing_ok=True)
+                except OSError:
+                    logger.exception("Cannot remove expired audio %s", path)
+                    continue  # Retry later; don't lose its database reference.
+            conn.execute("DELETE FROM cough_records WHERE id = ?", (record_id,))
+    return len(rows)
+
+def cleanup_old_audio_files(days_old=None):
+    """Scan owned WAV files, including historical orphans; retention uses file mtime."""
+    days = AUDIO_RETENTION_DAYS if days_old is None else days_old
+    cutoff = time.time() - days * 86400
+    removed = 0
+    for path in Path(AUDIO_STORAGE_PATH).glob("cough_*.wav"):
+        if not _owned_audio_path(path):
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("Cannot clean audio %s", path)
+    _clear_missing_audio_references()
+    enforce_audio_storage_limit()
+    return removed
 
 def enforce_audio_storage_limit():
-    """Проверяет и соблюдает лимит файлов"""
-    try:
-        # Получаем все файлы с информацией о дате
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, file_path, timestamp FROM cough_records 
-            WHERE file_path != '' 
-            ORDER BY timestamp ASC
-        ''')
-        
-        files = cursor.fetchall()
-        
-        if len(files) <= MAX_AUDIO_FILES:
-            return
-        
-        # Удаляем самые старые файлы сверх лимита
-        files_to_delete = files[:len(files) - MAX_AUDIO_FILES]
-        
-        deleted_count = 0
-        for record_id, file_path, _ in files_to_delete:
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                    deleted_count += 1
-                    
-                    cursor.execute('''
-                        UPDATE cough_records 
-                        SET file_path = '', audio_saved = 0 
-                        WHERE id = ?
-                    ''', (record_id,))
-                except Exception as e:
-                    logger.error(f"Ошибка удаления файла {file_path}: {e}")
-        
-        conn.commit()
-        conn.close()
-        
-        if deleted_count > 0:
-            logger.info(f"🧹 Удалено {deleted_count} файлов для соблюдения лимита {MAX_AUDIO_FILES}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка проверки лимита хранилища: {e}")
+    files = []
+    for path in Path(AUDIO_STORAGE_PATH).glob("cough_*.wav"):
+        if _owned_audio_path(path):
+            try:
+                files.append((path.stat().st_mtime_ns, str(path), path))
+            except FileNotFoundError:
+                pass
+    for _, _, path in sorted(files)[:max(0, len(files) - MAX_AUDIO_FILES)]:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Cannot enforce audio limit: %s", path)
+    _clear_missing_audio_references()
 
 def save_cough_audio(audio_bytes: bytes, device_id: str, probability: float) -> str:
     """Сохраняет аудио с кашлем в файл"""
@@ -247,6 +215,10 @@ def load_models():
         logger.info("YAMNet загружен")
         
         SCALER = joblib.load('cough_scaler_final_optimized.pkl')
+        if getattr(SCALER, "n_features_in_", None) != 2079:
+            raise ValueError("Scaler must expect 2079 features")
+        if OUR_MODEL.input_shape[-1] != 2079 or OUR_MODEL.output_shape[-1] != 1:
+            raise ValueError("Expected model input 2079 and one output")
         logger.info("Scaler загружен")
         
     except Exception as e:
@@ -297,15 +269,9 @@ def extract_features_new(waveform, sr, yamnet_model):
             [zcr_mean, rms_mean]
         ])
         
-        expected_dim = 2079
-        if len(combined) != expected_dim:
-            logger.warning(f"Размерность фич {len(combined)} вместо {expected_dim}")
-            if len(combined) > expected_dim:
-                combined = combined[:expected_dim]
-            else:
-                padding = np.zeros(expected_dim - len(combined))
-                combined = np.concatenate([combined, padding])
-        
+        if combined.shape != (2079,):
+            raise ValueError(f"Expected 2079 features, got {combined.shape}")
+
         return combined
         
     except Exception as e:
@@ -376,145 +342,128 @@ def fast_enhanced_check(waveform, sr, original_prob):
 # ---- Feature penalty ----
 
 def analyze_audio(audio_bytes: bytes, filename: str) -> dict:
-    """Анализ аудио с новой моделью и улучшенной проверкой"""
-    if not OUR_MODEL or not SCALER or not YAMNET_MODEL:
-        return {"probability": 0.0, "cough_detected": False, "message": "Модели не загружены"}
-    
+    """Same one-second/2079-feature model input; no heuristic penalties by default."""
+    if OUR_MODEL is None or SCALER is None or YAMNET_MODEL is None:
+        raise HTTPException(503, "Models are not loaded")
+    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
-        
-        waveform, sr = librosa.load(tmp_path, sr=16000, duration=1.0)
-        os.unlink(tmp_path)
-        
-        rms = float(np.sqrt(np.mean(waveform**2)))
-        if rms < 0.02:
-            return {"probability": 0.0, "cough_detected": False, "message": "Тишина"}
-        
-        max_val = np.max(np.abs(waveform))
-        if max_val < 0.01:
-            return {"probability": 0.0, "cough_detected": False, "message": "Слишком тихо"}
-        
-        waveform = waveform / (max_val + 1e-8)
-        
-        target_length = 16000
-        if len(waveform) < target_length:
-            waveform = np.pad(waveform, (0, target_length - len(waveform)))
-        else:
-            waveform = waveform[:target_length]
-        
-        features = extract_features_new(waveform, sr, YAMNET_MODEL)
-        
-        if features is None:
-            return {"probability": 0.0, "cough_detected": False, "message": "Ошибка извлечения фич"}
-    
-        if len(features) != 2079:
-            logger.error(f"Неверная размерность фич: {len(features)} вместо 2079")
-            if len(features) < 2079:
-                padding = np.zeros(2079 - len(features))
-                features = np.concatenate([features, padding])
-            else:
-                features = features[:2079]
-        
-        features_scaled = SCALER.transform(features.reshape(1, -1))
-        
-        prediction = OUR_MODEL.predict(features_scaled, verbose=0)
-        original_prob = float(prediction[0][0])
-        
-        # === ДОБАВЛЕНА УЛУЧШЕННАЯ ПРОВЕРКА ===
-        enhanced_prob = fast_enhanced_check(waveform, sr, original_prob)
-        
-        # Логируем разницу для отладки
-        prob_diff = original_prob - enhanced_prob
-        if prob_diff > 0.1:  # Значительное снижение
-            logger.warning(f"⚠️ Сильное снижение вероятности: {original_prob:.3f} → {enhanced_prob:.3f} (diff: -{prob_diff:.3f})")
-        
-        is_cough = enhanced_prob > THRESHOLD
-        
-        logger.info(f"🎯 Анализ: {filename} | orig={original_prob:.3f} | enhanced={enhanced_prob:.3f} | cough={is_cough}")
-        
-        return {
-            "probability": float(enhanced_prob),  # float()
-            "original_probability": float(original_prob),  # float()
-            "cough_detected": bool(is_cough),  # bool() а не np.bool_
-            "confidence": float(enhanced_prob),  # float()
-            "message": "COUGH_DETECTED" if is_cough else "NO_COUGH",
-            "cough_count": 1 if is_cough else 0,
-            "enhancement_applied": bool(enhanced_prob != original_prob),  # bool()
-            "probability_reduction": float(prob_diff) if prob_diff > 0 else 0.0  # float()
-        }
-        
-    except Exception as e:
-        logger.error(f"Ошибка анализа: {e}")
-        return {"probability": 0.0, "cough_detected": False, "message": f"Ошибка: {str(e)}"}
+        try:
+            waveform, sr = librosa.load(tmp_path, sr=16000, mono=True, duration=1.0)
+        except Exception as error:
+            raise HTTPException(422, "Cannot decode audio") from error
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+    if not len(waveform) or not np.isfinite(waveform).all():
+        raise HTTPException(422, "Audio is empty or contains non-finite samples")
+    rms = float(np.sqrt(np.mean(waveform**2)))
+    peak = float(np.max(np.abs(waveform)))
+    clipping_fraction = float(np.mean(np.abs(waveform) >= 0.999))
+    skipped = peak == 0 or rms < MIN_RMS or peak < MIN_PEAK
+    original_prob = 0.0
+    final_prob = 0.0
+    if not skipped:
+        waveform = waveform / (peak + 1e-8)
+        waveform = np.pad(waveform, (0, max(0, 16000-len(waveform))))[:16000]
+        with _MODEL_LOCK:
+            features = extract_features_new(waveform, sr, YAMNET_MODEL)
+            if features is None or features.shape != (2079,) or not np.isfinite(features).all():
+                raise RuntimeError("Feature extraction failed")
+            features_scaled = SCALER.transform(features.reshape(1, -1))
+            if not np.isfinite(features_scaled).all():
+                raise RuntimeError("Scaler produced non-finite values")
+            prediction = np.asarray(OUR_MODEL.predict(features_scaled, verbose=0))
+        if prediction.shape != (1, 1):
+            raise RuntimeError("Unexpected model output shape: %s" % (prediction.shape,))
+        original_prob = float(prediction[0, 0])
+        if not np.isfinite(original_prob) or not 0 <= original_prob <= 1:
+            raise RuntimeError("Model output is not a finite score in [0, 1]")
+        final_prob = (fast_enhanced_check(waveform, sr, original_prob)
+                      if ENABLE_LEGACY_ENHANCEMENT else original_prob)
+    detected = bool(not skipped and final_prob > THRESHOLD)
+    logger.info("analysis file=%s rms=%.6f peak=%.6f clipping=%.4f orig=%.4f final=%.4f threshold=%.3f skipped=%s cough=%s",
+                filename, rms, peak, clipping_fraction, original_prob, final_prob, THRESHOLD, skipped, detected)
+    return {
+        "probability": float(final_prob), "original_probability": float(original_prob),
+        "cough_detected": detected, "confidence": float(final_prob),
+        "message": "Тишина" if skipped else "COUGH_DETECTED" if detected else "NO_COUGH",
+        "cough_count": 1 if detected else 0,
+        "enhancement_applied": bool(ENABLE_LEGACY_ENHANCEMENT and not skipped),
+        "probability_reduction": float(max(0.0, original_prob-final_prob)),
+        "threshold": THRESHOLD, "rms": rms, "peak": peak,
+        "clipping_fraction": clipping_fraction, "skipped_by_gate": bool(skipped),
+        "legacy_enhancement_enabled": ENABLE_LEGACY_ENHANCEMENT
+    }
 
 # ---- API Endpoints ----
 
 @app.post("/upload")
-async def upload_audio(audio: UploadFile = File(...), device_id: str = Form("unknown")):
-    """Загрузка аудио и анализ"""
-    logger.info(f"📥 Загрузка: {audio.filename}, device_id: {device_id}")
-    
+def upload_audio(audio: UploadFile = File(...), device_id: str = Form("unknown")):
+    """Synchronous route runs in FastAPI's thread pool, not on the asyncio event loop."""
+    global _last_cleanup
+    raw = audio.file.read(MAX_UPLOAD_BYTES + 1)
+    if not raw:
+        raise HTTPException(400, "Empty file")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "Audio upload is too large")
+    filename = os.path.basename(audio.filename or "audio.wav")
+    digest = hashlib.sha256(raw).hexdigest()
     try:
-        cleanup_old_records()
-        
-        raw = await audio.read()
-        if len(raw) == 0:
-            raise HTTPException(400, "Пустой файл")
-        
-        current_datetime = get_current_datetime()
-        
-        result = analyze_audio(raw, audio.filename)
-        
-        # Сохраняем аудио если найден кашель
-        #audio_path = ""
-        #audio_saved = 0
-        #if result["cough_detected"]:
-            #audio_path = save_cough_audio(raw, device_id, result["probability"])
-            #audio_saved = 1 if audio_path else 0
-            
-        audio_path = save_cough_audio(raw, device_id, result["probability"])
-        audio_saved = int(bool(audio_path))
-
-
-        
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO cough_records 
-            (device_id, filename, file_path, probability, cough_detected, message, top_classes, cough_stats, timestamp, audio_saved)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            device_id, 
-            audio.filename,
-            audio_path,
-            float(result["probability"]),
-            int(result["cough_detected"]),
-            result["message"],
-            "[]",
-            json.dumps({"audio_saved": bool(audio_path)}),
-            current_datetime,
-            audio_saved
-        ))
-        record_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"✅ Результат: {result}, ID записи: {record_id}")
-        
-        return JSONResponse({
-            "status": "success", 
-            **result,
-            "record_id": record_id,
-            "audio_saved": bool(audio_path),
-            "download_url": f"/download/{record_id}" if audio_path else None,
-            "all_coughs_url": "/coughs/audio/all"
-        })
-        
-    except Exception as e:
-        logger.error(f"Ошибка загрузки: {e}")
-        raise HTTPException(500, str(e))
+        # Single worker recommended. Serialize DB+inference bookkeeping and network retries.
+        with _UPLOAD_LOCK:
+            if time.monotonic() - _last_cleanup > 60:
+                cleanup_old_audio_files()
+                cleanup_old_records()
+                _last_cleanup = time.monotonic()
+            with sqlite3.connect(DB_PATH) as conn:
+                recent = conn.execute("SELECT id, file_path, cough_stats FROM cough_records WHERE device_id=? AND filename=? ORDER BY id DESC LIMIT 1",
+                                      (device_id, filename)).fetchone()
+            if recent:
+                try:
+                    saved = json.loads(recent[2] or "{}")
+                except (ValueError, TypeError):
+                    saved = {}
+                if saved.get("sha256") == digest and "analysis" in saved:
+                    exists = bool(recent[1] and Path(recent[1]).is_file())
+                    return JSONResponse({"status": "success", **saved["analysis"], "record_id": recent[0],
+                        "audio_saved": exists, "download_url": f"/download/{recent[0]}" if exists else None,
+                        "all_coughs_url": "/coughs/audio/all", "duplicate": True})
+            result = analyze_audio(raw, filename)
+            path = save_cough_audio(raw, device_id, result["probability"])
+            if not path:
+                raise RuntimeError("Cannot save audio; retry later")
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.execute("""INSERT INTO cough_records
+                        (device_id, filename, file_path, probability, cough_detected, message, top_classes, cough_stats, timestamp, audio_saved)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (device_id, filename, path, result["probability"], int(result["cough_detected"]),
+                         result["message"], "[]", json.dumps({"audio_saved": True, "sha256": digest, "analysis": result}),
+                         get_current_datetime(), 1))
+                    record_id = cursor.lastrowid
+            except Exception:
+                Path(path).unlink(missing_ok=True)
+                raise
+            try:
+                enforce_audio_storage_limit()
+            except Exception:
+                # Record has committed: do not turn housekeeping failure into a duplicate upload.
+                logger.exception("Storage maintenance failed after successful upload")
+            exists = Path(path).is_file()
+            return JSONResponse({"status": "success", **result, "record_id": record_id,
+                "audio_saved": exists, "download_url": f"/download/{record_id}" if exists else None,
+                "all_coughs_url": "/coughs/audio/all"})
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Upload analysis/storage failed: %s", filename)
+        raise HTTPException(500, "Audio processing failed; retry later") from error
 
 @app.get("/download/{record_id}")
 async def download_audio(record_id: int):
@@ -753,10 +702,10 @@ async def get_audio_stats():
         )
 
 @app.delete("/coughs/audio/cleanup")
-async def cleanup_audio_endpoint(days_old: int = Query(AUDIO_RETENTION_DAYS, le=365)):
+async def cleanup_audio_endpoint(days_old: int = Query(AUDIO_RETENTION_DAYS, ge=1, le=365)):
     """Ручная очистка старых аудиофайлов"""
     try:
-        deleted_files = cleanup_old_audio_files()
+        deleted_files = cleanup_old_audio_files(days_old)
         
         return {
             "status": "success",
@@ -1031,7 +980,7 @@ async def export_records(device_id: str, format: str = "json"):
 
 @app.get("/health")
 async def health_check():
-    model_loaded = OUR_MODEL is not None and SCALER is not None
+    model_loaded = OUR_MODEL is not None and SCALER is not None and YAMNET_MODEL is not None
     db_exists = os.path.exists(DB_PATH)
     
     db_status = "healthy"
@@ -1065,6 +1014,9 @@ async def health_check():
         "current_audio_files": len([f for f in os.listdir(AUDIO_STORAGE_PATH) if os.path.isfile(os.path.join(AUDIO_STORAGE_PATH, f))]),
         "cleanup_interval_hours": CLEANUP_INTERVAL_HOURS,
         "threshold": THRESHOLD,
+        "legacy_enhancement_enabled": ENABLE_LEGACY_ENHANCEMENT,
+        "min_rms": MIN_RMS, "min_peak": MIN_PEAK,
+        "server_version": "3.1",
         "timestamp": datetime.now().isoformat(),
         "features_dimension": 2079 if model_loaded else "unknown"
     })
@@ -1072,11 +1024,11 @@ async def health_check():
 @app.get("/")
 async def root():
     return {
-        "message": "🔥 УЛУЧШЕННЫЙ Сервер Детекции Кашля v3.0",
-        "version": "3.0",
-        "features": "Сохранение аудио, лимит 1000 файлов, скачивание архива",
+        "message": "🔥 УЛУЧШЕННЫЙ Сервер Детекции Кашля v3.1",
+        "version": "3.1",
+        "features": "Сохранение аудио, настраиваемый лимит файлов, скачивание архива",
         "endpoints": {
-            "POST /upload": "Загрузить аудио (сохраняет если кашель)",
+            "POST /upload": "Загрузить аудио (сохраняет все успешные анализы)",
             "GET /download/{id}": "Скачать конкретный файл",
             "GET /coughs/audio/all": "СКАЧАТЬ ВСЕ ФАЙЛЫ (ZIP архив)",
             "GET /coughs/audio/list": "Список всех файлов с кашлем",
@@ -1092,17 +1044,17 @@ async def root():
 @app.on_event("startup")
 async def startup_event():
     """Запуск при старте сервера"""
-    logger.info("🚀 Запуск сервера детекции кашля v3.0...")
+    logger.info("🚀 Запуск сервера детекции кашля v3.1...")
     init_db()
     load_models()
     logger.info(f"✅ Сервер готов! Порог кашля: {THRESHOLD}")
     logger.info(f"💾 Аудиохранилище: {AUDIO_STORAGE_PATH}")
     logger.info(f"📁 Максимум файлов: {MAX_AUDIO_FILES}")
-    logger.info(f"🧹 Автоочистка записей: каждые {CLEANUP_INTERVAL_HOURS} часов")
-    logger.info(f"🗑️ Автоочистка аудио: каждые {AUDIO_RETENTION_DAYS} дней")
+    logger.info(f"🧹 Хранение записей: {CLEANUP_INTERVAL_HOURS} часов; обслуживание при загрузках")
+    logger.info(f"🗑️ Хранение аудио: до {AUDIO_RETENTION_DAYS} дней и {MAX_AUDIO_FILES} файлов")
 
 # ---- Main ----
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🚀 Starting COUGH DETECTION SERVER v3.0 on port {port}")
+    logger.info(f"🚀 Starting COUGH DETECTION SERVER v3.1 on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
